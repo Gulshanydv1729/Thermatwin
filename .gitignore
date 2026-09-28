@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Trained model weights: regenerable by train_and_save(), and the container
+# seeds its cache from simulation/trained_weights at build time.  Kept out of
+# git so a clone starts clean rather than carrying binary blobs.
+*.pt
+*.pth
+*.onnx
+
+# Agent scratch
+.bak
+*.bak

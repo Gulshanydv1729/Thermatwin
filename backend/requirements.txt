@@ -1,17 +1,48 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-sqlalchemy[asyncio]>=2.0.0
-asyncpg>=0.29.0
-pydantic>=2.0
-pydantic-settings>=2.0
-alembic>=1.13.0
-aiokafka>=0.10.0
-paho-mqtt>=2.0.0
-influxdb-client[asyncio]>=1.40.0
-httpx>=0.27.0
-pandas>=2.0.0
-numpy>=1.24.0
-scipy>=1.10.0
-scikit-learn>=1.2.0
-pytest>=8.0
-pytest-asyncio>=0.23.0
+# ThermaTwin backend runtime dependencies.
+#
+# Audited against the actual imports of `backend/app/**` and `simulation/**`:
+#   python  - fastapi, numpy, torch, pydantic
+#   tools   - uvicorn (server), httpx (simulation/synthetic_field_generator.py)
+#
+# Deliberately NOT here, and why:
+#   scipy             only imported by the legacy prototype (core/physics_engine.py);
+#                     backend/app has no scipy import. It stays in the root
+#                     requirements.txt, which is what the Streamlit app installs.
+#   python-multipart  no route uses Form()/File()/UploadFile; every POST body is JSON.
+#   sqlalchemy/asyncpg/alembic/aiokafka/paho-mqtt/influxdb-client/pandas
+#                     belong to the v2 "enterprise" Postgres/Kafka shim
+#                     (backend/main.py, backend/db/), which this image does not serve.
+#
+# torch is installed from the CPU-only wheel index — the models are a small
+# residual 1D CNN and a GRU that run in microseconds on CPU, so the ~2 GB of
+# CUDA runtime would be dead weight. The Dockerfile passes
+# --extra-index-url https://download.pytorch.org/whl/cpu; do the same by hand:
+#
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+#               -r backend/requirements.txt
+#
+# The upper bounds are advisory, not exact pins: they keep a future major
+# release from silently changing the physics results.
+
+# --- numerics --------------------------------------------------------------
+numpy>=1.26,<3.0
+
+# --- machine learning ------------------------------------------------------
+torch>=2.2,<3.0
+
+# --- web service -----------------------------------------------------------
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+# uvicorn[standard] already pulls websockets/httptools/uvloop/watchfiles/pyyaml,
+# which is what `--ws websockets` and the 500 ms telemetry push need.
+pydantic>=2.6,<3.0
+
+# --- field streamer (compose profile `simulation`) -------------------------
+httpx>=0.27,<1.0
+
+# --- test tooling ----------------------------------------------------------
+# Not needed to serve traffic, but ~5 MB and it lets the suites be run against
+# this interpreter with the tests bind-mounted:
+#   docker compose exec backend pytest backend/tests -q
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<1.0

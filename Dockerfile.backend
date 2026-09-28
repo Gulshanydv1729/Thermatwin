@@ -1,14 +1,136 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
+#
+# ThermaTwin digital twin — backend image.
+#
+# Serves `backend.app.main:app`, the v3 FastAPI application that holds all the
+# physics, the AI, the REST API under /api/v1 and the /ws/telemetry stream.
+#
+# The sibling `backend/main.py` is the older "v2 enterprise" Postgres/Kafka
+# shim.  It serves only /health and / and is NOT this product; nothing in this
+# image imports it, so it is not a dependency of the runtime.
+#
+# Python base: 3.12-slim.  The application needs nothing newer than 3.11
+# (`from __future__ import annotations` throughout, no PEP 695 / 3.13+ syntax
+# anywhere under backend/ or simulation/), and 3.12 is the newest CPython for
+# which every transitive wheel in this image is unambiguously published --
+# including the CPU-only PyTorch build.  Bumping this is a deliberate change,
+# not a routine one.
+#
+# Build context is the repository ROOT (`dockerfile: Dockerfile.backend`), not
+# backend/, because the app is imported as `backend.app.*` and resolves its
+# checkpoint against `<repo>/simulation/trained_weights`.
+
+# ---------------------------------------------------------------------------
+# Stage 1 — dependencies, installed into a self-contained venv
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+COPY backend/requirements.txt ./requirements.txt
+
+# The AI models are a residual 1D CNN and a small GRU; they run in
+# microseconds on CPU. The CPU-only wheel index avoids pulling ~2 GB of CUDA
+# libraries for no benefit.
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
+    && /opt/venv/bin/pip install \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Stage 2 — runtime
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+LABEL org.opencontainers.image.title="ThermaTwin Digital Twin" \
+      org.opencontainers.image.version="3.0.0" \
+      org.opencontainers.image.description="Well-to-surface digital twin for cyclic steam stimulation and sucker rod pump operations (SIH26120, Baghewala, Oil India Limited)" \
+      org.opencontainers.image.source="https://example.invalid/thermatwin"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    THERMATWIN_LOG_LEVEL=INFO \
+    THERMATWIN_PORT=8000 \
+    THERMATWIN_WEIGHTS_DIR=/data/trained_weights
+
+# curl is used by the HEALTHCHECK below (and by the compose health check, which
+# overrides it with the same command).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# The application is imported as `backend.app.*`, so the repository root must be
+# the working directory and on sys.path.
+#
+# `core/` and `components/` are the legacy Streamlit prototype. backend/app does
+# not import them (verified by grep for `^from core|^import core|^from
+# components|^import components` -> no matches), so they are deliberately NOT
+# copied: shipping them would imply a dependency that does not exist.
+COPY backend/ /app/backend/
 
-COPY backend/ ./backend/
-COPY core/ ./core/
-COPY components/ ./components/
+# simulation/ is required, not optional:
+#   * DEFAULT_WEIGHTS_DIR in backend/app/core/config.py points at
+#     <repo>/simulation/trained_weights and is what the app falls back to when
+#     THERMATWIN_WEIGHTS_DIR is unset;
+#   * simulation/synthetic_field_generator.py is the field streamer, which runs
+#     from this same image in the `simulation` compose profile.
+COPY simulation/ /app/simulation/
+
+# Seed the writable weights directory from the checkpoint in the build context.
+# A fresh named volume mounted on /data/trained_weights is initialised by Docker
+# from the image contents of that path, so this makes the pre-trained classifier
+# survive a `docker compose up` without retraining.
+#
+# The checkpoint is a build artifact (it is gitignored), so its absence must not
+# fail the build — the app's warm-up trains it instead.
+RUN mkdir -p /data/trained_weights \
+    && if ls /app/simulation/trained_weights/*.pt >/dev/null 2>&1; then \
+           cp -n /app/simulation/trained_weights/*.pt /data/trained_weights/ \
+           && echo "seeded pre-trained checkpoint(s):" && ls -1 /data/trained_weights/; \
+       else \
+           echo "NOTE: no pre-trained checkpoint in the build context; warm-up will train on first boot"; \
+       fi
+
+# Fail the build, not the deploy, if the copy set or the dependency set is
+# wrong. This imports the whole application (including torch) and asserts that
+# the real routes are mounted — an image that quietly builds while serving only
+# /health and / is exactly the bug this file used to have.
+#
+# Route introspection has to be version-tolerant: FastAPI >= 0.141 keeps
+# included routers as `_IncludedRouter` objects instead of flattening them into
+# `app.routes`, so the walk also descends into `.original_router`. Kept to a
+# single line because the classic builder cannot take a multi-line RUN.
+RUN python -c 'from backend.app.main import app; rs=list(app.router.routes); paths={getattr(r,"path",None) for r in rs}|set(app.openapi()["paths"]); paths|={getattr(x,"path",None) for r in rs if (g:=getattr(r,"original_router",None)) is not None for x in g.routes}; assert "/api/v1/health" in paths, sorted(paths); assert "/api/v1/control/apply" in paths, sorted(paths); assert "/ws/telemetry" in paths, sorted(paths); print("build-time import check ok:", app.title, "v"+app.version, len(paths), "routes")'
+
+# Run unprivileged. /app and /data must be owned by the app user because the
+# weight cache is written at runtime.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin thermatwin \
+    && chown -R thermatwin:thermatwin /app /data
+USER thermatwin
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# /api/v1/health exists in backend/app/api/routes.py. The start period is
+# generous because a build context with no checkpoint trains the classifier on
+# the very first boot.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=5 \
+    CMD curl -fsS http://127.0.0.1:8000/api/v1/health || exit 1
+
+# One worker on purpose: the twin holds process-wide state (the EKF and the VFD
+# setpoints), so a second worker would serve a divergent twin against the same
+# well. Horizontal scale needs an external store first.
+CMD ["uvicorn", "backend.app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--ws", "websockets", \
+     "--timeout-keep-alive", "75"]

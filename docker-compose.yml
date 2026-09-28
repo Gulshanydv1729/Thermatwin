@@ -1,8 +1,154 @@
-version: "3.9"
+# ThermaTwin — well-to-surface digital twin
+#
+# SIH26120 · Oil India Limited · Baghewala heavy oil asset
+#
+#   docker compose up --build
+#
+#   dashboard   http://localhost:8080   (nginx; proxies /api and /ws)
+#   API         http://localhost:8000   (docs at /docs)
+#   telemetry   ws://localhost:8000/ws/telemetry
+#
+# The previous compose file — the v2 Postgres / Timescale / InfluxDB / Kafka /
+# Mosquitto data stack — is preserved verbatim as docker-compose.yml.bak. None
+# of those services is referenced by the digital twin, so they are NOT in the
+# active file. They are still available under the opt-in `legacy` profile
+# (postgres, timescaledb, influxdb, zookeeper, kafka, mosquitto) if you need to
+# compare against the old stack:
+#
+#   docker compose --profile legacy up -d
+#
+# The optional `simulation` profile replays a synthetic field lifecycle into the
+# running twin:
+#
+#   docker compose --profile simulation run --rm streamer
+#
+# Host port note: the dashboard is published on 8080. The old stack used 8086
+# for InfluxDB; 8080 was chosen because it is free in the backup file and is the
+# conventional "web app" port, so the legacy profile (8086) can still be brought
+# up at the same time without a collision.
+
+name: thermatwin
 
 services:
+  # ---------------------------------------------------------------------------
+  # API — reservoir + wellbore + rod string + AI + EKF + controller.
+  #
+  # Build context is the repository ROOT: the app is imported as
+  # `backend.app.main:app` and resolves its checkpoint under simulation/.
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: thermatwin/backend:3.0.0
+    container_name: thermatwin-backend
+    environment:
+      THERMATWIN_LOG_LEVEL: INFO
+      # The AI checkpoint cache. A fresh named volume is seeded by Docker from
+      # whatever this path holds in the image, and backend/Dockerfile seeds it
+      # from simulation/trained_weights at build time — so the classifier is
+      # loaded, not retrained, on first boot. Without the volume the container
+      # would retrain from scratch on every restart.
+      THERMATWIN_WEIGHTS_DIR: /data/trained_weights
+      # Set to "1" to skip the on-boot warm-up entirely. Every physics endpoint
+      # still serves; only the AI diagnosis is cold.
+      THERMATWIN_SKIP_WARMUP: "0"
+      # 500 ms telemetry broadcast period (the contract in talk.md §2).
+      THERMATWIN_STREAM_INTERVAL_S: "0.5"
+    volumes:
+      - weights:/data/trained_weights
+    ports:
+      # Parameterised so `run.sh` can move the stack when the host port is
+      # already taken:  API_PORT=8010 docker compose up
+      - "${API_PORT:-8000}:8000"
+    # The image also carries this HEALTHCHECK; it is repeated here so
+    # `docker compose config` shows it and so the probe is explicit.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      # Generous: the first start trains the dyno card classifier, which takes
+      # several seconds before the port begins answering.
+      start_period: 90s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Dashboard — Vite build served by nginx.
+  #
+  # frontend/nginx.conf proxies /api/ and /ws/ to upstream `thermatwin_backend`
+  # on backend:8000, so this service depends on the service being *named*
+  # `backend` and being reachable on 8000. It is published on 8080.
+  #
+  # There are deliberately no VITE_* variables here: the bundle is built at
+  # image build time with VITE_API_BASE="" and VITE_WS_URL="/ws/telemetry", so
+  # the client uses site-relative URLs and goes through this same nginx proxy.
+  # Setting them in `environment:` would have no effect on an already-built
+  # static bundle and would only mislead the next reader.
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: thermatwin/frontend:3.0.0
+    container_name: thermatwin-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${DASHBOARD_PORT:-8080}:80"
+    healthcheck:
+      # /healthz is answered by nginx itself and does not touch the backend.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Optional: replay a synthetic field lifecycle into the running twin.
+  #
+  #   docker compose --profile simulation run --rm streamer
+  #
+  # Runs from the backend image because the generator only needs httpx.
+  # ---------------------------------------------------------------------------
+  streamer:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: thermatwin/backend:3.0.0
+    profiles: ["simulation"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      THERMATWIN_LOG_LEVEL: INFO
+    # Override to choose cycles, phase length or an injected fault:
+    #   docker compose --profile simulation run --rm streamer \
+    #       python simulation/synthetic_field_generator.py \
+    #       --cycles 3 --production-days 60 --fault ROD_FLOATING
+    command:
+      - python
+      - simulation/synthetic_field_generator.py
+      - --url
+      - http://backend:8000
+      - --cycles
+      - "2"
+      - --production-days
+      - "60"
+      - --interval
+      - "0.1"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Legacy profile — the previous data stack from docker-compose.yml.bak.
+  # Preserved and off by default. The digital twin reads no database and
+  # publishes no Kafka topic; these exist only for side-by-side comparison.
+  # ---------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
+    profiles: ["legacy"]
     environment:
       POSTGRES_USER: thermatwin
       POSTGRES_PASSWORD: thermatwin
@@ -19,6 +165,7 @@ services:
 
   timescaledb:
     image: timescale/timescaledb:latest-pg16
+    profiles: ["legacy"]
     environment:
       POSTGRES_USER: thermatwin
       POSTGRES_PASSWORD: thermatwin
@@ -35,6 +182,7 @@ services:
 
   influxdb:
     image: influxdb:2.7
+    profiles: ["legacy"]
     environment:
       INFLUXDB_ADMIN_USER: thermatwin
       INFLUXDB_ADMIN_PASSWORD: thermatwin123
@@ -47,68 +195,38 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: vfd_telemetry
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: thermatwin-token
     ports:
-      - "8086:8086"
+      - "8086:8086"   # not 8080 — 8080 is the dashboard
     volumes:
       - influxdb_data:/var/lib/influxdb2
 
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    profiles: ["legacy"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
   kafka:
     image: confluentinc/cp-kafka:7.6.0
+    profiles: ["legacy"]
     depends_on:
       - zookeeper
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ADVERTED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     ports:
       - "9092:9092"
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-
   mosquitto:
     image: eclipse-mosquitto:2
+    profiles: ["legacy"]
     ports:
       - "1883:1883"
-    volumes:
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
-
-  backend:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-    depends_on:
-      postgres:
-        condition: service_healthy
-      timescaledb:
-        condition: service_healthy
-    environment:
-      THERMATWIN_POSTGRES_HOST: postgres
-      THERMATWIN_TIMESCALEDB_HOST: timescaledb
-      THERMATWIN_TIMESCALEDB_PORT: 5432
-      THERMATWIN_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      THERMATWIN_MQTT_HOST: mosquitto
-    ports:
-      - "8000:8000"
-
-  ingestion:
-    build:
-      context: .
-      dockerfile: Dockerfile.ingestion
-    depends_on:
-      kafka:
-        condition: service_started
-      mosquitto:
-        condition: service_started
-    environment:
-      THERMATWIN_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      THERMATWIN_MQTT_HOST: mosquitto
-      THERMATWIN_TIMESCALEDB_HOST: timescaledb
-      THERMATWIN_TIMESCALEDB_PORT: 5432
 
 volumes:
+  # The AI checkpoint cache. Seeded from the image on first use.
+  weights:
   postgres_data:
   timescaledb_data:
   influxdb_data:

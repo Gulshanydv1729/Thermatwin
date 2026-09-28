@@ -1,0 +1,41 @@
+# Keep the Docker build context small and reproducible.
+#
+# The backend image is built from the repository root because the application
+# is imported as `backend.app.*` and reads its checkpoint from `simulation/`.
+# Without this file the 1.8 GB local `venv/` is uploaded on every build.
+
+# --- virtualenvs and Python caches -----------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- node ------------------------------------------------------------------
+node_modules/
+frontend/dist/
+
+# --- version control and editor state --------------------------------------
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# --- compose/backup duplicates (never needed inside an image) ---------------
+docker-compose.yml
+docker-compose.yml.bak
+Dockerfile*
+README.md
+README.md.bak
+PLAN*.md
+PITCH_REFERENCE.md
+talk.md
+*.bak
+
+# --- local datasets --------------------------------------------------------
+data/
+*.csv
