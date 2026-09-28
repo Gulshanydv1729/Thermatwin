@@ -108,16 +108,32 @@ port_busy() {
 # Best-effort "<name> (pid)" for whatever holds the port.  Empty when the holder
 # is not ours to inspect, which is normal and not an error.
 port_owner() {
-    local port="$1"
+    local port="$1" owner=""
     if have ss; then
         # `ss -p` reports users:(("name",pid=123,fd=4)); reduce that to
         # "name (123)" so a port clash reads as something actionable.  The
         # substitution is one pass because the fd field follows the pid.
-        ss -ltnpH "sport = :$port" 2>/dev/null | head -1 \
-            | sed -nE 's/.*users:\(\("?([^",]+)"?,pid=([0-9]+).*/\1 (\2)/p' || true
+        owner="$(ss -ltnpH "sport = :$port" 2>/dev/null | head -1 \
+            | sed -nE 's/.*users:\(\("?([^",]+)"?,pid=([0-9]+).*/\1 (\2)/p' || true)"
     elif have lsof; then
-        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1" ("$2")"}' | head -1 || true
+        owner="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1" ("$2")"}' | head -1 || true)"
     fi
+    [[ -n "$owner" ]] && { echo "$owner"; return 0; }
+
+    # A container published on the host port is held by docker-proxy, which runs
+    # as root and is therefore not attributable to this user.  `ss` shows the
+    # socket with no users: field at all, so without this the clash reports
+    # "a process this user cannot identify" and gives the operator nothing to
+    # act on.  Name the container instead.
+    if have docker; then
+        local container
+        container="$(docker ps --filter "publish=$port" --format '{{.Names}}' 2>/dev/null | head -1)"
+        if [[ -n "$container" ]]; then
+            echo "docker container '$container'"
+            return 0
+        fi
+    fi
+    return 0
 }
 
 require_free_port() {
@@ -138,6 +154,11 @@ require_free_port() {
     err "port $port is already in use — $what cannot start"
     if [[ -n "$owner" ]]; then
         err "  held by $owner"
+        case "$owner" in
+            docker\ container*)
+                err "  stop it with:  ./run.sh stop"
+                ;;
+        esac
     else
         err "  held by a process this user cannot identify"
     fi
